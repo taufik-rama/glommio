@@ -447,7 +447,7 @@ pub use crate::{
     },
     executor::{
         allocate_dma_buffer, allocate_dma_buffer_global, early_init, executor, spawn_local,
-        spawn_local_into, spawn_scoped_local, spawn_scoped_local_into,
+        spawn_local_into, spawn_local_with_executor, spawn_scoped_local, spawn_scoped_local_into,
         stall::{DefaultStallDetectionHandler, StallDetection, StallDetectionHandler},
         yield_if_needed, CpuSet, ExecutorJoinHandle, ExecutorProxy, ExecutorStats, LocalExecutor,
         LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement, PoolPlacement,

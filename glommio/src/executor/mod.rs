@@ -1149,7 +1149,7 @@ pub struct LocalExecutor {
 }
 
 impl LocalExecutor {
-    fn get_reactor(&self) -> Rc<Reactor> {
+    pub(crate) fn get_reactor(&self) -> Rc<Reactor> {
         self.reactor.clone()
     }
 
@@ -1476,76 +1476,13 @@ impl LocalExecutor {
     /// assert_eq!(res, 6);
     /// ```
     pub fn run<T>(&self, future: impl Future<Output = T>) -> T {
-        let run = |this: &Self| {
-            // this waker is never exposed in the public interface and is only used to check
-            // whether the task's `JoinHandle` is `Ready`
-            let waker = dummy_waker();
-            let cx = &mut Context::from_waker(&waker);
-
-            let spin_before_park = self.spin_before_park().unwrap_or_default();
-
-            let future = this
-                .spawn_into(future, TaskQueueHandle::default())
-                .unwrap()
-                .detach();
-            pin!(future);
-
-            let mut pre_time = Instant::now();
-            loop {
-                if let Poll::Ready(t) = future.as_mut().poll(cx) {
-                    // can't be canceled, and join handle is None only upon
-                    // cancellation or panic. So in case of panic this just propagates
-                    let cur_time = Instant::now();
-                    this.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
-                    break t.unwrap();
-                }
-
-                // We want to do I/O before we call run_task_queues,
-                // for the benefit of the latency ring. If there are pending
-                // requests that are latency sensitive we want them out of the
-                // ring ASAP (before we run the task queues). We will also use
-                // the opportunity to install the timer.
-                this.parker
-                    .poll_io(|| Some(this.preempt_timer_duration()))
-                    .expect("Failed to poll io! This is actually pretty bad!");
-
-                // run user code
-                let run = this.run_task_queues();
-
-                // account for runtime and poll/sleep if possible
-                let cur_time = Instant::now();
-                this.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
-                pre_time = cur_time;
-                if !run {
-                    if let Poll::Ready(t) = future.as_mut().poll(cx) {
-                        // It may be that we just became ready now that the task queue
-                        // is exhausted. But if we sleep (park) we'll never know so we
-                        // test again here. We can't test *just* here because the main
-                        // future is probably the one setting up the task queues and etc.
-                        break t.unwrap();
-                    } else {
-                        while !this.reactor.spin_poll_io().unwrap() {
-                            if pre_time.elapsed() > spin_before_park {
-                                this.parker
-                                    .park()
-                                    .expect("Failed to park! This is actually pretty bad!");
-                                break;
-                            }
-                        }
-                        // reset the timer for deduct spin loop time
-                        pre_time = Instant::now();
-                    }
-                }
-            }
-        };
-
         #[cfg(not(feature = "native-tls"))]
         {
             assert!(
                 !LOCAL_EX.is_set(),
                 "There is already an LocalExecutor running on this thread"
             );
-            LOCAL_EX.set(self, || run(self))
+            LOCAL_EX.set(self, || self.run_no_static(future))
         }
 
         #[cfg(feature = "native-tls")]
@@ -1557,7 +1494,73 @@ impl LocalExecutor {
 
             defer!(LOCAL_EX = std::ptr::null());
             LOCAL_EX = self as *const Self;
-            run(self)
+            self.run_no_static(future)
+        }
+    }
+
+    /// Runs the executor without setting the static/global Glommio runtime.
+    ///
+    /// Note: this will cause issues for method calls that expect the global runtime to be set
+    pub fn run_no_static<T>(&self, future: impl Future<Output = T>) -> T {
+        // this waker is never exposed in the public interface and is only used to check
+        // whether the task's `JoinHandle` is `Ready`
+        let waker = dummy_waker();
+        let cx = &mut Context::from_waker(&waker);
+
+        let spin_before_park = self.spin_before_park().unwrap_or_default();
+
+        let future = self
+            .spawn_into(future, TaskQueueHandle::default())
+            .unwrap()
+            .detach();
+        pin!(future);
+
+        let mut pre_time = Instant::now();
+        loop {
+            if let Poll::Ready(t) = future.as_mut().poll(cx) {
+                // can't be canceled, and join handle is None only upon
+                // cancellation or panic. So in case of panic this just propagates
+                let cur_time = Instant::now();
+                self.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
+                break t.unwrap();
+            }
+
+            // We want to do I/O before we call run_task_queues,
+            // for the benefit of the latency ring. If there are pending
+            // requests that are latency sensitive we want them out of the
+            // ring ASAP (before we run the task queues). We will also use
+            // the opportunity to install the timer.
+            self.parker
+                .poll_io(|| Some(self.preempt_timer_duration()))
+                .expect("Failed to poll io! This is actually pretty bad!");
+
+            // run user code
+            let run = self.run_task_queues();
+
+            // account for runtime and poll/sleep if possible
+            let cur_time = Instant::now();
+            self.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
+            pre_time = cur_time;
+            if !run {
+                if let Poll::Ready(t) = future.as_mut().poll(cx) {
+                    // It may be that we just became ready now that the task queue
+                    // is exhausted. But if we sleep (park) we'll never know so we
+                    // test again here. We can't test *just* here because the main
+                    // future is probably the one setting up the task queues and etc.
+                    break t.unwrap();
+                } else {
+                    while !self.reactor.spin_poll_io().unwrap() {
+                        if pre_time.elapsed() > spin_before_park {
+                            self.parker
+                                .park()
+                                .expect("Failed to park! This is actually pretty bad!");
+                            break;
+                        }
+                    }
+                    // reset the timer for deduct spin loop time
+                    pre_time = Instant::now();
+                }
+            }
         }
     }
 }
@@ -1960,6 +1963,17 @@ where
     T: 'static,
 {
     executor().spawn_local(future)
+}
+
+/// Similar to [`spawn_local`] but without the static executor
+pub fn spawn_local_with_executor<T>(
+    future: impl Future<Output = T> + 'static,
+    ex: &LocalExecutor,
+) -> Task<T>
+where
+    T: 'static,
+{
+    Task::<T>(ex.spawn(future))
 }
 
 /// Allocates a buffer that is suitable for using to write to Direct Memory

@@ -11,7 +11,7 @@ use crate::{
     },
     reactor::Reactor,
     sys::Source,
-    GlommioError,
+    GlommioError, LocalExecutor,
 };
 use futures_lite::{
     future::poll_fn,
@@ -136,6 +136,36 @@ impl TcpListener {
 
         Ok(TcpListener {
             reactor: Rc::downgrade(&crate::executor().reactor()),
+            listener,
+            current_source: Default::default(),
+        })
+    }
+
+    /// `bind` calls with executor passed
+    pub fn bind_with_executor<A: ToSocketAddrs>(
+        addr: A,
+        ex: &LocalExecutor,
+    ) -> Result<TcpListener> {
+        let addr = addr
+            .to_socket_addrs()
+            .unwrap()
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "empty address"))?;
+
+        let domain = if addr.is_ipv6() {
+            Domain::IPV6
+        } else {
+            Domain::IPV4
+        };
+        let sk = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        let addr = socket2::SockAddr::from(addr);
+        sk.set_reuse_port(true)?;
+        sk.bind(&addr)?;
+        sk.listen(1024)?;
+        let listener = sk.into();
+
+        Ok(TcpListener {
+            reactor: Rc::downgrade(&ex.get_reactor()),
             listener,
             current_source: Default::default(),
         })

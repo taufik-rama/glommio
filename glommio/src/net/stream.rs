@@ -154,6 +154,80 @@ impl RxBuf for Preallocated {
     }
 }
 
+/// Burrowed-variant of `Preallocated`
+#[derive(Debug)]
+pub struct BurrowedPreallocated<'alloc> {
+    buf: &'alloc mut [u8],
+    head: usize,
+    tail: usize,
+}
+
+impl<'alloc> BurrowedPreallocated<'alloc> {
+    /// Creates a burrowed receive buffer
+    pub fn new(buf: &'alloc mut [u8]) -> Self {
+        Self {
+            buf,
+            tail: 0,
+            head: 0,
+        }
+    }
+}
+
+impl<'alloc> BurrowedPreallocated<'alloc> {
+    fn len(&self) -> usize {
+        self.tail - self.head
+    }
+}
+
+impl<'alloc> Buffered for BurrowedPreallocated<'alloc> {}
+
+impl<'alloc> RxBuf for BurrowedPreallocated<'alloc> {
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        let sz = std::cmp::min(self.len(), buf.len());
+        if sz > 0 {
+            buf[..sz].copy_from_slice(&self.buf[self.head..self.head + sz]);
+            self.head += sz;
+        }
+        sz
+    }
+
+    fn peek(&self, buf: &mut [u8]) -> usize {
+        let sz = std::cmp::min(self.len(), buf.len());
+        if sz > 0 {
+            buf[..sz].copy_from_slice(&self.buf[self.head..self.head + sz]);
+        }
+        sz
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head >= self.tail
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[self.head..self.tail]
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.head += std::cmp::min(self.len(), amt);
+    }
+
+    fn buffer_size(&self) -> usize {
+        self.buf.len()
+    }
+
+    fn handle_result(&mut self, result: usize) {
+        self.tail += result;
+    }
+
+    fn unfilled(&mut self) -> &mut [u8] {
+        if self.len() == 0 {
+            self.head = 0;
+            self.tail = 0;
+        }
+        &mut self.buf[self.tail..]
+    }
+}
+
 #[derive(Debug)]
 struct Timeout {
     id: u64,
